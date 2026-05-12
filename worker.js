@@ -17,7 +17,7 @@ const IP_FORMAT_REGEX = /^(\[[a-fA-F0-9:]+\]|[^:#\[\]]+)(?::(\d+))?(#.*)?$/;
 
 // Clash 订阅后端 API 配置
 const CLASH_API_URL = "https://api.v1.mk/sub";
-const CLASH_RULE_URL = "https://raw.githubusercontent.com/zhuqq2020/Mihomo-Party-ACL4SSR/refs/heads/ACL4SSR/ACL4SSR_Online_Full_MultiMode_Cloudflare.ini";
+const CLASH_RULE_URL = "https://raw.githubusercontent.com/cmliu/ACL4SSR/refs/heads/main/Clash/config/ACL4SSR_Online_Mini_MultiMode_CF.ini";
 
 // ==========================================
 // 核心工具函数
