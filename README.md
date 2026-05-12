@@ -57,7 +57,8 @@
 **3. 设置环境变量 (Environment Variables)**
 * `ADMIN_PASSWORD`：设置后台管理面板的登录密码（例如 `Admin@123`）。登录账号任意，密码需与此一致。
 * `SUB_TOKEN`：设置生成订阅的安全秘钥（例如 `MySecretToken888`），用户前端生成时必须填写。
-
+* `CLASH_API_URL`：设置clash订阅转换后端（默认：https://api.v1.mk/sub）。
+* `CLASH_RULE_URL`：设置clash订阅转换规则文件（默认：https://raw.githubusercontent.com/cmliu/ACL4SSR/refs/heads/main/Clash/config/ACL4SSR_Online_Mini_MultiMode_CF.ini）
 ## 🚀 使用说明
 
 ### 1. 公开订阅生成页 (`/`)
