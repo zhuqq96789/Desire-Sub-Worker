@@ -14,6 +14,8 @@ database_name = "sub-db"
 database_id = "请替换为你的_D1_数据库_ID"
 
 # --- 环境变量建议在 Cloudflare 后台面板设置以保证安全 ---
-# [vars]
+[vars]
 # ADMIN_PASSWORD = "your_admin_password" 
 # SUB_TOKEN = "your_sub_token"
+CLASH_API_URL = "https://api.v1.mk/sub"
+CLASH_RULE_URL = "https://raw.githubusercontent.com/cmliu/ACL4SSR/refs/heads/main/Clash/config/ACL4SSR_Online_Mini_MultiMode_CF.ini"
