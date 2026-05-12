@@ -706,7 +706,7 @@ button:disabled { opacity: 0.7; cursor: not-allowed; }
     </div>
 
     <div class="footer">
-        本项目由: <a href="https://github.com/DesireOr2/Desire-Sub-Worker" target="_blank" class="tg-link">Desire-Sub-Worker</a>提供技术支持 - 由 <a href="https://github.com/zhuqq2020/Desire-Sub-Worker" target="_blank" class="tg-link">SPGCC</a> 提供维护 &copy; 2099
+        本项目由: <a href="https://github.com/DesireOr2/Desire-Sub-Worker" target="_blank" class="tg-link">Desire-Sub-Worker</a>提供技术支持 - 由 <a href="https://github.com/zhuqq96789/Desire-Sub-Worker" target="_blank" class="tg-link">SPGCC</a> 提供维护 &copy; 2099
     </div>
 </div>
 <script>
