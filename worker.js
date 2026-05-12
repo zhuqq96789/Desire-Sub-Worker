@@ -15,6 +15,10 @@ const REGION_PATTERNS = REGIONS.map(r => `(${r})`).join('|');
 const COMBINED_REGION_REGEX = new RegExp(REGION_PATTERNS, 'i');
 const IP_FORMAT_REGEX = /^(\[[a-fA-F0-9:]+\]|[^:#\[\]]+)(?::(\d+))?(#.*)?$/;
 
+// Clash 订阅后端 API 配置
+const CLASH_API_URL = "https://api.v1.mk/sub";
+const CLASH_RULE_URL = "https://raw.githubusercontent.com/zhuqq2020/Mihomo-Party-ACL4SSR/refs/heads/ACL4SSR/ACL4SSR_Online_Full_MultiMode_Cloudflare.ini";
+
 // ==========================================
 // 核心工具函数
 // ==========================================
@@ -23,11 +27,112 @@ const err = (m, s = 400) => Response.json({ error: m }, { status: s });
 const encodeBase64 = (str) => btoa(unescape(encodeURIComponent(str)));
 const decodeBase64 = (str) => decodeURIComponent(escape(atob(str)));
 
-// 生成伪装错误节点，让客户端能成功解析并显示报错信息
+// 生成伪装错误节点
 const createErrorNode = (msg) => {
     return `vless://00000000-0000-0000-0000-000000000000@127.0.0.1:80?encryption=none&security=none&type=tcp#${encodeURIComponent(msg)}`;
 };
 
+// 生成 Clash 格式的错误配置
+const createErrorClashConfig = (msg) => {
+    return `# Clash 配置文件生成失败
+# 错误信息: ${msg}
+# 请检查您的订阅配置
+
+proxies:
+  - name: "❌ 订阅生成失败: ${msg}"
+    type: vless
+    server: 127.0.0.1
+    port: 80
+    uuid: 00000000-0000-0000-0000-000000000000
+    udp: false
+    tls: false
+    skip-cert-verify: true
+
+proxy-groups:
+  - name: "PROXY"
+    type: select
+    proxies:
+      - "❌ 订阅生成失败: ${msg}"
+
+rules:
+  - MATCH,PROXY
+`;
+};
+
+// 计算本月已过天数百分比（按30天一个月计算）
+const getMonthProgressPercent = () => {
+    const now = new Date();
+    const dayOfMonth = now.getDate();
+    const effectiveDays = Math.min(dayOfMonth, 30);
+    const progressPercent = (effectiveDays / 30) * 100;
+    return progressPercent;
+};
+
+// 根据百分比动态计算已用流量
+const calculateDynamicTraffic = (totalTraffic) => {
+    const progressPercent = getMonthProgressPercent();
+    const usedTraffic = (totalTraffic * progressPercent) / 100;
+    return {
+        used: usedTraffic,
+        percent: progressPercent,
+        remaining: totalTraffic - usedTraffic,
+        upload: Math.floor(usedTraffic),
+        download: 0
+    };
+};
+
+// 生成带流量信息的 Clash 配置头部
+const generateClashHeader = (userInfo, host) => {
+    const now = new Date();
+    const expireDate = userInfo.expireTime ? new Date(userInfo.expireTime) : null;
+    
+    let header = `#---------------------------------------------------#
+#              ${host}_CF优选订阅
+#---------------------------------------------------#
+# 更新时间: ${now.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}
+`;
+
+    if (userInfo.total) {
+        const total = userInfo.total;
+        const dynamicTraffic = calculateDynamicTraffic(total);
+        const usedPercent = dynamicTraffic.percent.toFixed(1);
+        
+        header += `#---------------------------------------------------#
+# 流量信息（动态计算）:
+#   总流量: ${formatBytes(total)}
+#   本月已用: ${formatBytes(dynamicTraffic.used)} / ${formatBytes(total)} (${usedPercent}%)
+#   本月剩余: ${formatBytes(dynamicTraffic.remaining)}
+`;
+    }
+    
+    if (expireDate && !isNaN(expireDate.getTime())) {
+        const daysLeft = Math.ceil((expireDate - now) / (1000 * 60 * 60 * 24));
+        header += `#   到期时间: ${expireDate.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}
+#   剩余天数: ${daysLeft} 天
+`;
+    }
+    
+    if (userInfo.plan) {
+        header += `#   套餐名称: ${userInfo.plan}
+`;
+    }
+    
+    header += `#---------------------------------------------------#
+`;
+    
+    return header;
+};
+
+// 格式化字节数
+const formatBytes = (bytes) => {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+};
+
+// 解析 IP
 const parseIP = (ip) => {
     if (!ip) return { displayIp: '', port: '443', name: '' };
     const match = ip.match(IP_FORMAT_REGEX);
@@ -46,8 +151,130 @@ const extractRegion = (name) => {
 };
 const getRegionIndex = (region) => region ? (REGION_ORDER.get(region) ?? UNKNOWN_REGION_INDEX) : UNKNOWN_REGION_INDEX;
 
+// 检测客户端类型
+const detectClientType = (userAgent) => {
+    if (!userAgent) return 'v2ray';
+    const ua = userAgent.toLowerCase();
+    if (ua.includes('clash') || ua.includes('mihomo') || ua.includes('cfw') || 
+        ua.includes('clashx') || ua.includes('clash-verge') || ua.includes('clash.meta') ||
+        ua.includes('clashmeta')) {
+        return 'clash';
+    }
+    return 'standard';
+};
+
+// 从基础节点链接中提取真实的 host 地址
+const extractHostFromBaseLink = (baseLink) => {
+    if (!baseLink) return 'SPGCC';
+    
+    try {
+        if (baseLink.startsWith('vless://') || baseLink.startsWith('trojan://')) {
+            const url = new URL(baseLink);
+            let host = url.searchParams.get('sni');
+            if (!host) host = url.searchParams.get('host');
+            if (!host) host = url.hostname;
+            return host;
+        } 
+        else if (baseLink.startsWith('vmess://')) {
+            const b64 = baseLink.slice(8).replace(/-/g, '+').replace(/_/g, '/');
+            const config = JSON.parse(decodeBase64(b64));
+            return config.sni || config.host || config.add || 'SPGCC';
+        }
+    } catch (e) {
+        console.error('提取 host 失败:', e);
+    }
+    
+    return 'SPGCC';
+};
+
+// 构建带 Token 的订阅 URL
+const buildSubscriptionUrl = (baseUrl, baseLink, source, extUrl, token) => {
+    const url = new URL(baseUrl);
+    url.searchParams.set('base', baseLink);
+    if (token) url.searchParams.set('token', token);
+    if (source === 'ext' && extUrl) {
+        url.searchParams.set('source', source);
+        url.searchParams.set('ext_url', extUrl);
+    }
+    return url.toString();
+};
+
+// 获取用户流量信息
+const getUserTrafficInfo = async (kv, token) => {
+    if (kv && token) {
+        const userData = await kv.get(`user:${token}`);
+        if (userData) {
+            return JSON.parse(userData);
+        }
+    }
+    
+    return {
+        plan: "SPGCC 优选套餐",
+        total: 1000 * 1024 * 1024 * 1024,
+        expireTime: new Date(new Date().setFullYear(new Date().getFullYear() + 1)).toISOString(),
+    };
+};
+
+// 生成 Subscription-UserInfo 响应头
+const generateSubscriptionUserInfo = (userInfo) => {
+    if (!userInfo.total) return null;
+    
+    const dynamicTraffic = calculateDynamicTraffic(userInfo.total);
+    const expireTimestamp = userInfo.expireTime ? Math.floor(new Date(userInfo.expireTime).getTime() / 1000) : 0;
+    
+    return `upload=${dynamicTraffic.upload}; download=${dynamicTraffic.download}; total=${Math.floor(userInfo.total)}; expire=${expireTimestamp}`;
+};
+
+// 生成 Content-Disposition 文件名（RFC 2231 编码）
+const encodeContentDisposition = (filename) => {
+    const encodedFilename = encodeURIComponent(filename).replace(/['()]/g, escape).replace(/\*/g, '%2A');
+    return `attachment; filename*=UTF-8''${encodedFilename}; filename="${filename.replace(/[^a-zA-Z0-9\u4e00-\u9fa5]/g, '_')}"`;
+};
+
+// 将节点列表转换为 Clash 配置
+const convertToClashConfig = async (subscriptionUrl, apiUrl, ruleUrl, userInfo, host) => {
+    try {
+        const convertUrl = new URL(apiUrl);
+        convertUrl.searchParams.set('target', 'clash');
+        convertUrl.searchParams.set('url', subscriptionUrl);
+        convertUrl.searchParams.set('config', ruleUrl);
+        convertUrl.searchParams.set('include', '');
+        convertUrl.searchParams.set('exclude', '');
+        convertUrl.searchParams.set('emoji', 'true');
+        convertUrl.searchParams.set('udp', 'true');
+        
+        console.log('Converting to clash config:', convertUrl.toString());
+        
+        const response = await fetch(convertUrl.toString(), {
+            method: 'GET',
+            headers: {
+                'User-Agent': 'Clash-Client/1.0',
+                'Accept': 'text/yaml,text/plain,*/*'
+            }
+        });
+        
+        if (!response.ok) {
+            throw new Error(`API 请求失败: ${response.status} ${response.statusText}`);
+        }
+        
+        let clashConfig = await response.text();
+        
+        if (clashConfig.includes('订阅生成失败') || clashConfig.includes('❌')) {
+            throw new Error('订阅转换返回了错误配置');
+        }
+        
+        const header = generateClashHeader(userInfo, host);
+        clashConfig = header + '\n' + clashConfig;
+        
+        return clashConfig;
+    } catch (error) {
+        console.error('Clash 转换失败:', error);
+        return createErrorClashConfig(error.message);
+    }
+};
+
 // ==========================================
-// 核心订阅引擎：链接裂变拼接 (Multiplex)
+// 核心订阅引擎：链接裂变拼接
 // ==========================================
 const multiplexLink = (baseLink, premiumIpRow) => {
     const { displayIp, port, name } = parseIP(premiumIpRow.ip);
@@ -60,7 +287,6 @@ const multiplexLink = (baseLink, premiumIpRow) => {
             url.hostname = displayIp;
             if (port && port !== 'N/A') url.port = port;
             
-            // 直接赋值即可，URL对象会自动处理编码，避免双重编码导致客户端报错
             url.hash = nodeName;
             
             if (!url.searchParams.has('host') && originalHost) url.searchParams.set('host', originalHost);
@@ -73,7 +299,7 @@ const multiplexLink = (baseLink, premiumIpRow) => {
             if (!config.sni) config.sni = config.add;
             if (!config.host) config.host = config.add;
             config.add = displayIp;
-            if (port && port !== 'N/A') config.port = port;
+            if (port && port !== 'N/A') config.port = parseInt(port);
             config.ps = nodeName; 
             return 'vmess://' + encodeBase64(JSON.stringify(config));
         }
@@ -323,6 +549,26 @@ const api = {
             } catch (e) { await saveTask(kv, taskId, 'failed', e.message); }
         })());
         return json({ success: true, async: true, taskId });
+    },
+    async getUserInfo(kv, token) {
+        const userInfo = await getUserTrafficInfo(kv, token);
+        const dynamicTraffic = calculateDynamicTraffic(userInfo.total);
+        return json({
+            ...userInfo,
+            dynamicTraffic: {
+                usedPercent: dynamicTraffic.percent.toFixed(1),
+                used: formatBytes(dynamicTraffic.used),
+                remaining: formatBytes(dynamicTraffic.remaining),
+                total: formatBytes(userInfo.total),
+                dayOfMonth: new Date().getDate()
+            }
+        });
+    },
+    async updateUserInfo(kv, token, body) {
+        const userInfo = await getUserTrafficInfo(kv, token);
+        const updatedInfo = { ...userInfo, ...body };
+        await kv.put(`user:${token}`, JSON.stringify(updatedInfo));
+        return json({ success: true });
     }
 };
 
@@ -333,17 +579,27 @@ const handleApiRoute = async (req, db, ctx, kv) => {
     try {
         const body = (method === 'POST' || method === 'PUT') ? await req.json().catch(() => ({})) : {};
         
-        // --- 【新增】处理短链生成的 API ---
         if (path === '/shorten' && method === 'POST') {
             const { longUrl } = body;
             if (!longUrl) return err('链接不能为空');
-            // 生成 6 位随机短码
             const shortId = Math.random().toString(36).substring(2, 8);
             if (kv) {
                 await kv.put(`short:${shortId}`, longUrl);
                 return json({ success: true, shortId });
             }
             return err('未绑定 KV 空间', 500);
+        }
+        
+        if (path === '/user/info' && method === 'GET') {
+            const token = url.searchParams.get('token');
+            if (!token) return err('缺少 token 参数');
+            return api.getUserInfo(kv, token);
+        }
+        
+        if (path === '/user/update' && method === 'POST') {
+            const { token, ...updates } = body;
+            if (!token) return err('缺少 token 参数');
+            return api.updateUserInfo(kv, token, updates);
         }
 
         if (path === '/ips' && method === 'GET') return api.getIps(db, url.searchParams);
@@ -367,17 +623,17 @@ const handleApiRoute = async (req, db, ctx, kv) => {
 };
 
 // ==========================================
-// 前端 HTML: 公开生成页面 (已脱敏 + 支持短链)
+// 前端 HTML 页面（保持不变）
 // ==========================================
 const getPublicHTML = () => `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>YOUR_BRAND_NAME优选订阅</title>
+<title>SPGCC优选订阅</title>
 <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
 <style>
-body { background-color: #1a1a2e; background-image: url('YOUR_BACKGROUND_IMAGE_URL'); background-size: cover; background-position: center; background-attachment: fixed; color: #fff; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 20px; box-sizing: border-box; }
+body { background-color: #1a1a2e; background-image: url('https://bing.ee123.net/img/rand'); background-size: cover; background-position: center; background-attachment: fixed; color: #fff; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 20px; box-sizing: border-box; }
 .card { background: rgba(44, 44, 44, 0.7); backdrop-filter: blur(15px); -webkit-backdrop-filter: blur(15px); padding: 40px; border-radius: 20px; width: 100%; max-width: 500px; box-shadow: 0 10px 40px rgba(0,0,0,0.6); text-align: center; border: 1px solid rgba(255, 255, 255, 0.1); }
 .avatar { width: 80px; height: 80px; border-radius: 50%; background: #fff; margin: 0 auto 20px; display: flex; align-items: center; justify-content: center; font-size: 40px; overflow: hidden; box-shadow: 0 4px 15px rgba(0,0,0,0.3); }
 .avatar img { width: 100%; height: 100%; object-fit: cover; }
@@ -401,8 +657,8 @@ button:disabled { opacity: 0.7; cursor: not-allowed; }
 </head>
 <body>
 <div class="card">
-    <div class="avatar"><img src="YOUR_AVATAR_IMAGE_URL" alt="Logo"></div>
-    <h1>YOUR_BRAND_NAME优选订阅</h1>
+    <div class="avatar"><img src="https://play-lh.googleusercontent.com/Y7sRltILft4Mt7fl1AT8eArOX8UijSAehcdzzSa1e5-hvi9TTzCMoYFQoEYL0fbpaJY=s128-rw" alt="Logo"></div>
+    <h1>SPGCC优选订阅</h1>
     
     <div class="form-group">
         <label>基础节点链接</label>
@@ -420,20 +676,20 @@ button:disabled { opacity: 0.7; cursor: not-allowed; }
     <div class="form-group" id="extUrlGroup" style="display: none;">
         <label>外部优选库接口 (API 或 TXT)</label>
         <select id="extUrlSelect" onchange="document.getElementById('extUrl').value = this.value" style="margin-bottom: 8px;">
-            <option value="https://api.example.com/ct?ips=6">📶 动态测速 API - 电信优先</option>
-            <option value="https://api.example.com/cu">📶 动态测速 API - 联通优先</option>
-            <option value="https://api.example.com/cmcc?ips=8">📶 动态测速 API - 移动优先</option>
-            <option value="https://api.example.com/CloudFlareYes">🌐 动态测速 API - 通用官方</option>
-            <option value="https://raw.githubusercontent.com/cmliu/WorkerVless2sub/main/addressesapi.txt">📦 静态 TXT 库 - cmliu (备用)</option>
+            <option value="https://cf.090227.xyz/ct?ips=100">📶 动态测速 API - 电信优选</option>
+            <option value="https://cf.090227.xyz/cu?ips=100">📶 动态测速 API - 联通优选</option>
+            <option value="https://cf.090227.xyz/cmcc?ips=100">📶 动态测速 API - 移动优选</option>
+            <option value="https://cf.090227.xyz/CloudFlareYes">🌐 动态测速 API - 通用官方</option>
+            <option value="https://raw.githubusercontent.com/zhuqq2020/CloudflareIP_NEW/refs/heads/main/All.txt">📦 静态 TXT 库 - 本人 (备用)</option>
             <option value="">✍️ 自定义：清空并手动输入链接...</option>
         </select>
-        <input type="text" id="extUrl" placeholder="请选择上方接口或粘贴你的链接..." value="https://api.example.com/ct?ips=6" autocomplete="off">
+        <input type="text" id="extUrl" placeholder="请选择上方接口或粘贴你的链接..." value="https://cf.090227.xyz/ct?ips=100" autocomplete="off">
     </div>
 
     <div class="form-group">
         <label>
             安全 Token (必填!)
-            <a href="https://t.me/YOUR_TELEGRAM" target="_blank" style="font-size: 12px; color: #58a6ff; font-weight: normal; margin-left: 8px; text-decoration: none;">(前往获取)</a>
+            <a href="https://t.me/+UqUGreTFpjJzfHwN" target="_blank" style="font-size: 12px; color: #58a6ff; font-weight: normal; margin-left: 8px; text-decoration: none;">(前往获取)</a>
         </label>
         <input type="password" id="subToken" placeholder="防止接口被他人滥用生成订阅, 请输入" autocomplete="off">
     </div>
@@ -450,7 +706,7 @@ button:disabled { opacity: 0.7; cursor: not-allowed; }
     </div>
 
     <div class="footer">
-        支持: <a href="https://t.me/YOUR_GROUP" target="_blank" class="tg-link">加入tg群组获取最新动态</a> - 由 YOUR_NAME 提供维护 &copy; 2026
+        本项目由: <a href="https://github.com/DesireOr2/Desire-Sub-Worker" target="_blank" class="tg-link">Desire-Sub-Worker</a>提供技术支持 - 由 <a href="https://github.com/zhuqq2020/Desire-Sub-Worker" target="_blank" class="tg-link">SPGCC</a> 提供维护 &copy; 2099
     </div>
 </div>
 <script>
@@ -472,13 +728,11 @@ async function generateSub() {
     btn.innerText = "生成中..."; btn.style.opacity = "0.7";
     btn.disabled = true;
     
-    // 1. 拼接原有的参数
     let subParams = '/sub?base=' + encodeURIComponent(link);
     if(token) subParams += '&token=' + encodeURIComponent(token);
     if(source === 'ext') subParams += '&source=ext&ext_url=' + encodeURIComponent(extUrl);
     
     try {
-        // 2. 调用 API 生成短链
         const res = await fetch('/api/shorten', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -487,11 +741,9 @@ async function generateSub() {
         const data = await res.json();
 
         if (data.success) {
-            // 3. 组装最终的短链显示给用户
             const shortUrl = window.location.origin + '/s/' + data.shortId;
             document.getElementById('subResult').value = shortUrl;
             
-            // 生成二维码
             const qrWrap = document.getElementById('qrWrap');
             const qrCodeBox = document.getElementById('qrCodeBox');
             qrCodeBox.innerHTML = ''; 
@@ -504,11 +756,11 @@ async function generateSub() {
             });
         } else {
             alert('生成短链失败: ' + (data.error || '未知错误'));
-            document.getElementById('subResult').value = window.location.origin + subParams; // 降级显示长链
+            document.getElementById('subResult').value = window.location.origin + subParams;
         }
     } catch (e) {
         alert('网络请求失败，请检查控制台。');
-        document.getElementById('subResult').value = window.location.origin + subParams; // 降级显示长链
+        document.getElementById('subResult').value = window.location.origin + subParams;
     } finally {
         btn.innerText = "生成优选短链"; 
         btn.style.opacity = "1";
@@ -524,9 +776,6 @@ function copyLink() {
 </body>
 </html>`;
 
-// ==========================================
-// 前端 HTML: 后台优选 IP 管理面板
-// ==========================================
 const getAdminHTML = () => `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -729,7 +978,7 @@ const openEdit = (id, ip, port, name, priority) => {
     $('editId').value = id; 
     $('editIp').value = ip + ':' + port; 
     $('editName').value = name; 
-    $('editPriority').value = priority; // 新增：将权重回显到输入框
+    $('editPriority').value = priority;
     $('editModal').style.display = 'flex'; 
 };
 const closeEdit = () => { $('editModal').style.display = 'none'; };
@@ -737,12 +986,11 @@ const saveEdit = async () => {
     const id = $('editId').value;
     const ipStr = $('editIp').value.trim();
     const nameStr = $('editName').value.trim();
-    const priorityVal = parseInt($('editPriority').value); // 读取权重输入框的值
+    const priorityVal = parseInt($('editPriority').value);
 
     if(!ipStr) return msg('IP不能为空');
     let fullIP = ipStr; if(nameStr) fullIP += '#' + nameStr;
 
-    // 构造发送给后端的数据包
     const updateBody = { ip: fullIP };
     if (!isNaN(priorityVal)) updateBody.priority = priorityVal; 
 
@@ -771,7 +1019,7 @@ load();
 </html>`;
 
 // ==========================================
-// 密码验证核心逻辑 (Basic Auth)
+// 密码验证核心逻辑
 // ==========================================
 const checkAuth = (req, env) => {
     const expectedPassword = env.ADMIN_PASSWORD;
@@ -801,13 +1049,12 @@ export default {
         const url = new URL(req.url);
         const path = url.pathname;
 
-        // --- 【新增】处理短链跳转 (公开接口，无密码拦截) ---
+        // 处理短链跳转
         if (path.startsWith('/s/')) {
-            const shortId = path.slice(3); // 截取 /s/ 后面的字符
+            const shortId = path.slice(3);
             if (env.TASK_KV) {
                 const longUrl = await env.TASK_KV.get(`short:${shortId}`);
                 if (longUrl) {
-                    // 使用 302 重定向到真实的 /sub 长链接，并将原长链自动拼在域名后
                     return Response.redirect(new URL(longUrl, url.origin).toString(), 302);
                 }
             }
@@ -816,7 +1063,6 @@ export default {
 
         // 安全拦截区
         if (path === '/admin' || path.startsWith('/api/')) {
-            // 放行公开的 /api/shorten 接口，避免前端无法生成短链
             if (path !== '/api/shorten' && !checkAuth(req, env)) {
                 return new Response('Unauthorized', {
                     status: 401,
@@ -837,26 +1083,103 @@ export default {
             });
         }
 
-        // --- /sub 接口：终极防爆修复版 ---
+        // /sub 接口：自适应订阅
         if (path === '/sub') {
             const baseLink = url.searchParams.get('base');
             const reqToken = url.searchParams.get('token');
             const source = url.searchParams.get('source'); 
             const extUrl = url.searchParams.get('ext_url');
 
-            // 1. Token 校验
+            // Token 校验
             const expectedToken = env.SUB_TOKEN;
             if (expectedToken && reqToken !== expectedToken) {
-                return new Response(encodeBase64(createErrorNode('❌ Token 验证失败，请检查链接参数')), { 
-                    headers: { 'Content-Type': 'text/plain;charset=utf-8', 'Cache-Control': 'no-cache' } 
-                });
+                const userAgent = req.headers.get('User-Agent') || '';
+                const clientType = detectClientType(userAgent);
+                
+                if (clientType === 'clash') {
+                    return new Response(createErrorClashConfig('Token 验证失败，请检查链接参数'), {
+                        headers: { 
+                            'Content-Type': 'text/yaml;charset=utf-8',
+                            'Content-Disposition': `attachment; filename="error_subscription"`,
+                            'Cache-Control': 'no-cache'
+                        }
+                    });
+                } else {
+                    const errorMsg = encodeBase64(createErrorNode('❌ Token 验证失败，请检查链接参数'));
+                    return new Response(errorMsg, { 
+                        headers: { 
+                            'Content-Type': 'text/plain;charset=utf-8', 
+                            'Cache-Control': 'no-cache',
+                            'Content-Disposition': 'attachment; filename="error_subscription.txt"'
+                        } 
+                    });
+                }
             }
 
-            if (!baseLink) return new Response(encodeBase64(createErrorNode('❌ 请在首页输入基础节点链接')), {
-                headers: { 'Content-Type': 'text/plain;charset=utf-8', 'Cache-Control': 'no-cache' }
-            });
+            if (!baseLink) {
+                const userAgent = req.headers.get('User-Agent') || '';
+                const clientType = detectClientType(userAgent);
+                
+                if (clientType === 'clash') {
+                    return new Response(createErrorClashConfig('请在首页输入基础节点链接'), {
+                        headers: { 
+                            'Content-Type': 'text/yaml;charset=utf-8',
+                            'Content-Disposition': `attachment; filename="error_subscription"`,
+                            'Cache-Control': 'no-cache'
+                        }
+                    });
+                } else {
+                    const errorMsg = encodeBase64(createErrorNode('❌ 请在首页输入基础节点链接'));
+                    return new Response(errorMsg, {
+                        headers: { 
+                            'Content-Type': 'text/plain;charset=utf-8', 
+                            'Cache-Control': 'no-cache',
+                            'Content-Disposition': 'attachment; filename="error_subscription.txt"'
+                        }
+                    });
+                }
+            }
 
-            // 2. 缓存读取
+            // 检测客户端类型
+            const userAgent = req.headers.get('User-Agent') || '';
+            const clientType = detectClientType(userAgent);
+            
+            // 从基础节点链接中提取真实的 host 地址
+            const host = extractHostFromBaseLink(baseLink);
+            // 生成纯英文的订阅名称（避免乱码）
+            const subscriptionNameEn = `${host}_CF_Subscription`;
+            const subscriptionNameZh = `${host}_CF优选订阅`;
+            
+            // 获取用户流量信息
+            const userInfo = await getUserTrafficInfo(env.TASK_KV, reqToken);
+            
+            // 对于 Clash 客户端，直接返回 subconverter 转换后的结果
+            if (clientType === 'clash') {
+                const currentUrl = new URL(req.url);
+                const serviceBaseUrl = `${currentUrl.protocol}//${currentUrl.host}`;
+                const subscriptionUrl = buildSubscriptionUrl(serviceBaseUrl + '/raw_sub', baseLink, source, extUrl, reqToken);
+                
+                const clashApiUrl = env.CLASH_API_URL || CLASH_API_URL;
+                const clashRuleUrl = env.CLASH_RULE_URL || CLASH_RULE_URL;
+                
+                const clashConfig = await convertToClashConfig(subscriptionUrl, clashApiUrl, clashRuleUrl, userInfo, host);
+                
+                const headers = {
+                    'Content-Type': 'text/yaml;charset=utf-8',
+                    'Content-Disposition': encodeContentDisposition(subscriptionNameZh),
+                    'Cache-Control': `public, max-age=${CACHE_TTL}`,
+                    'Profile-Updated': new Date().toUTCString()
+                };
+                
+                const userInfoHeader = generateSubscriptionUserInfo(userInfo);
+                if (userInfoHeader) {
+                    headers['Subscription-UserInfo'] = userInfoHeader;
+                }
+                
+                return new Response(clashConfig, { headers });
+            }
+            
+            // 对于 Hiddify 和其他客户端，使用英文名称避免乱码
             const cache = caches.default;
             const cacheKey = new Request(url.toString(), req); 
             let res = await cache.match(cacheKey);
@@ -864,16 +1187,13 @@ export default {
 
             let ipRows = [];
 
-            // 3. 获取数据源
             if (source === 'ext' && extUrl) {
                 try {
-                    // 加上 User-Agent 伪装，防止被部分外部链接的防火墙拦截
                     const extRes = await fetch(extUrl, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }});
                     if (!extRes.ok) throw new Error(`HTTP状态码异常: ${extRes.status}`);
                     
                     const extText = await extRes.text();
                     
-                    // 防御检查：如果拉取到的内容是 HTML（比如防CC盾、404网页），直接报错，防止生成无效节点
                     if (extText.trim().startsWith('<')) {
                         throw new Error('获取到的是网页而非纯文本列表，可能是链接失效或触发了防CC拦截');
                     }
@@ -887,8 +1207,99 @@ export default {
                         };
                     }).filter(r => r.ip);
                 } catch (e) {
-                    // 核心修复：如果是外部拉取报错，返回一个伪装的 VLESS 节点，将错误原因直接显示在客户端列表里！
-                    return new Response(encodeBase64(createErrorNode(`❌ 外部优选库拉取失败: ${e.message}`)), {
+                    const errorMsg = encodeBase64(createErrorNode(`❌ 外部优选库拉取失败: ${e.message}`));
+                    return new Response(errorMsg, {
+                        headers: { 
+                            'Content-Type': 'text/plain;charset=utf-8', 
+                            'Cache-Control': 'no-cache',
+                            'Content-Disposition': encodeContentDisposition(subscriptionNameZh)
+                        }
+                    });
+                }
+            } else {
+                const { results } = await env.DB.prepare(
+                    'SELECT ip, name FROM ips WHERE active=1 ORDER BY priority, id LIMIT ?'
+                ).bind(MAX_IPS).all();
+                ipRows = results;
+            }
+
+            const generatedLinks = ipRows
+                .map(row => multiplexLink(baseLink, row))
+                .filter(Boolean)
+                .join('\n');
+
+            const finalNodes = generatedLinks || createErrorNode('❌ 没有生成任何可用节点(可能是基础节点格式不兼容或无优选IP)');
+            
+            // 构建订阅内容
+            let subscriptionContent = finalNodes;
+            const trafficComment = generateSubscriptionUserInfo(userInfo);
+            if (trafficComment) {
+                subscriptionContent = `# ${trafficComment}\n${finalNodes}`;
+            }
+            
+            const nodesBase64 = encodeBase64(subscriptionContent);
+
+            // 使用英文名称避免 Hiddify 显示乱码，同时保留中文名称在 Content-Disposition 中
+            const headers = {
+                'Content-Type': 'text/plain;charset=utf-8',
+                'Content-Disposition': encodeContentDisposition(subscriptionNameZh),
+                'Cache-Control': `public, max-age=${CACHE_TTL}`,
+                'Subscription-UserInfo': generateSubscriptionUserInfo(userInfo) || '',
+                'Profile-Updated': new Date().toUTCString(),
+                'profile-title': subscriptionNameEn,
+                'profile-update-interval': '24',
+                'profile-web-page-url': url.origin
+            };
+
+            res = new Response(nodesBase64, { headers });
+
+            ctx.waitUntil(cache.put(cacheKey, res.clone()));
+            return res;
+        }
+        
+        // 原始订阅接口（用于 subconverter 转换）
+        if (path === '/raw_sub') {
+            const baseLink = url.searchParams.get('base');
+            const reqToken = url.searchParams.get('token');
+            const source = url.searchParams.get('source'); 
+            const extUrl = url.searchParams.get('ext_url');
+
+            const expectedToken = env.SUB_TOKEN;
+            if (expectedToken && reqToken !== expectedToken) {
+                return new Response(encodeBase64(createErrorNode('Token 验证失败')), {
+                    headers: { 'Content-Type': 'text/plain;charset=utf-8', 'Cache-Control': 'no-cache' }
+                });
+            }
+
+            if (!baseLink) {
+                return new Response(encodeBase64(createErrorNode('缺少基础节点链接')), {
+                    headers: { 'Content-Type': 'text/plain;charset=utf-8', 'Cache-Control': 'no-cache' }
+                });
+            }
+
+            let ipRows = [];
+
+            if (source === 'ext' && extUrl) {
+                try {
+                    const extRes = await fetch(extUrl, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }});
+                    if (!extRes.ok) throw new Error(`HTTP状态码异常: ${extRes.status}`);
+                    
+                    const extText = await extRes.text();
+                    
+                    if (extText.trim().startsWith('<')) {
+                        throw new Error('获取到的是网页而非纯文本列表');
+                    }
+
+                    const lines = extText.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
+                    ipRows = lines.map(line => {
+                        const { displayIp, port, name } = parseIP(line);
+                        return { 
+                            ip: port === 'N/A' ? displayIp : `${displayIp}:${port}`, 
+                            name: name || '外网优选节点' 
+                        };
+                    }).filter(r => r.ip);
+                } catch (e) {
+                    return new Response(encodeBase64(createErrorNode(`外部优选库拉取失败: ${e.message}`)), {
                         headers: { 'Content-Type': 'text/plain;charset=utf-8', 'Cache-Control': 'no-cache' }
                     });
                 }
@@ -899,24 +1310,20 @@ export default {
                 ipRows = results;
             }
 
-            // 4. 合并裂变
             const generatedLinks = ipRows
                 .map(row => multiplexLink(baseLink, row))
                 .filter(Boolean)
                 .join('\n');
 
-            // 5. 兜底检查
-            const finalOutput = generatedLinks || createErrorNode('❌ 没有生成任何可用节点(可能是基础节点格式不兼容或无优选IP)');
+            const finalNodes = generatedLinks || createErrorNode('没有生成任何可用节点');
+            const nodesBase64 = encodeBase64(finalNodes);
 
-            res = new Response(encodeBase64(finalOutput), {
+            return new Response(nodesBase64, {
                 headers: {
                     'Content-Type': 'text/plain;charset=utf-8',
                     'Cache-Control': `public, max-age=${CACHE_TTL}`
                 }
             });
-
-            ctx.waitUntil(cache.put(cacheKey, res.clone()));
-            return res;
         }
 
         if (path.startsWith('/api/')) {
